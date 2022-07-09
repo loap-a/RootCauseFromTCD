@@ -32,17 +32,6 @@ class Span:
 
         self.callgraph_index = -1
 
-    def __init__(self, caller, callee, metric, entry_span):
-        self.caller = caller
-        self.callee = callee
-        self.metric = metric
-        self.entry_span = entry_span
-
-        self.discovered = False
-        self.anomaly_detected = False
-
-        self.callgraph_index = -1
-
     def __eq__(self, span):
         if span == None:
             return False
@@ -71,11 +60,11 @@ class Span:
         self.rt = [np.nan]*1440
 
         for exception, timeout, index in zip(exception_list, timeout_list, range(0,1440)):
-            if exception != None and timeout != None:
+            if (not np.isnan(exception)) and (not np.isnan(timeout)):
                 self.ec[index] = exception + timeout
         
         for duration, request, index in zip(duration_list, request_list, range(0, 1440)):
-            if duration!=np.nan and request!=np.nan:
+            if (not np.isnan(duration)) and (not np.isnan(duration)):
                 self.rt[index] = duration/request
 
 
@@ -122,15 +111,16 @@ class Pearsonr_Pruning:
         for index in range(0, 1440):
             flag = True
             for span in self.compare_span_list:
-                if span.qpm[index] == np.nan:
+                if np.isnan(span.qpm[index]):
                     flag = False
             if flag:
+                self.compare_qpm[index] = 0.0
                 for span in self.compare_span_list:
                     self.compare_qpm[index] = self.compare_qpm[index] + span.qpm[index]
         data1 = []
         data2 = []
         for downstream_qpm_point, compare_qpm_point in zip(self.downstream_span.qpm, self.compare_qpm):
-            if downstream_qpm_point != np.nan and compare_qpm_point != np.nan:
+            if (not np.isnan(downstream_qpm_point)) and (not np.isnan(compare_qpm_point)):
                 data1.append(downstream_qpm_point)
                 data2.append(compare_qpm_point)
 
@@ -142,6 +132,9 @@ class Pearsonr_Pruning:
         else:
             self.similarity, self.p = pearsonr(data1, data2)
             self.similarity = abs(self.similarity)
+
+    def __str__(self):
+        return str(self.similarity)
 
 
 class Span_Chain:
@@ -155,6 +148,113 @@ class Span_Chain:
     def add_span_to_bottom(self, span):
         self.span_list.append(span)
 
+class SubSubGraph:
+    def __init__(self, span_list):
+        self.span_list = span_list
+        self.node_list = []
+        self.adjancy_matrix = []
+
+        self.end_nodes = []
+        self.end_spans = []
+        self.enter_spans = []
+        self.enter_nodes = []
+        
+        self.span_chains = []
+
+        for span in self.span_list:
+            self.node_list.append(span.get_caller())
+            self.node_list.append(span.get_callee())
+        self.node_list = (list(set(self.node_list)))
+
+        nodes_number = len(self.node_list)
+        for i in range(0, nodes_number):
+            temp_list = [None]*nodes_number
+            self.adjancy_matrix.append(temp_list)
+
+        for index, node in enumerate(self.node_list):
+            node.subsubgraph_index = index
+
+        for span in self.span_list:
+            row = span.get_caller().subsubgraph_index
+            col = span.get_callee().subsubgraph_index
+            self.adjancy_matrix[row][col] = span
+        
+        self.get_end_nodes_and_spans()
+        self.get_enter_nodes_and_spans()
+
+        self.floyd()
+        self.generate_span_chains()
+
+    def floyd(self):
+        self.floyd_g = []
+        self.floyd_d = []
+        nodes_number = len(self.node_list)
+        for i in range(0, nodes_number):
+            temp_list = [9999]*nodes_number
+            self.floyd_g.append(temp_list)
+        for i in range(0, nodes_number):
+            temp_list = list(range(0, nodes_number))
+            self.floyd_d.append(temp_list)
+        for row in range(0, nodes_number):
+            for col in range(0, nodes_number):
+                if self.adjancy_matrix[row][col] != None:
+                    self.floyd_g[row][col] = 1
+                    self.floyd_g[col][row] = 1
+        for k in range(0, nodes_number):
+            for i in range(0, nodes_number):
+                for j in range(0, nodes_number):
+                    if self.floyd_g[i][k] + self.floyd_g[k][j] < self.floyd_g[i][j]:
+                        self.floyd_g[i][j] = self.floyd_g[i][k] + self.floyd_g[k][j]
+                        self.floyd_d[i][j] = self.floyd_d[i][k]
+        
+    def generate_span_chains(self):
+        span_chains = []
+        for enter_node in self.enter_nodes:
+            for end_node in self.end_nodes:
+                node_chain = [enter_node]
+                enter_index = enter_node.subsubgraph_index
+                end_index = end_node.subsubgraph_index
+                k = self.floyd_d[enter_index][end_index]
+                while k!=end_index:
+                    node_chain.append(self.node_list[k])
+                    k = self.floyd_d[k][end_index]
+                node_chain.append(end_node)
+                span_chain = []
+
+                for i in range(0, len(node_chain)):
+                    if i+1 < len(node_chain):
+                        span_chain.append(self.adjancy_matrix[node_chain[i].subsubgraph_index][node_chain[i+1].subsubgraph_index])
+                span_chains.append(span_chain)   
+        self.span_chains = span_chains
+        return span_chains
+
+    def get_enter_nodes_and_spans(self):
+        for col in range(0, len(self.node_list)):
+            count = 0
+            for row in range(0, len(self.node_list)):
+                if self.adjancy_matrix[row][col] != None:
+                    count = count + 1
+            if count == 0:
+                self.enter_nodes.append(self.node_list[col])
+        for node in self.enter_nodes:
+            for col in range(0, len(self.node_list)):
+                if self.adjancy_matrix[node.subgraph_index][col] != None:
+                    self.enter_spans.append(self.adjancy_matrix[node.subgraph_index][col])
+
+    def get_end_nodes_and_spans(self):
+        for row in range(0, len(self.node_list)):
+            count = 0
+            for col in range(0, len(self.node_list)):
+                if self.adjancy_matrix[row][col] != None:
+                    count = count + 1
+            if count == 0:
+                self.end_nodes.append(self.node_list[row])
+        for node in self.end_nodes:
+            for row in range(0, len(self.node_list)):
+                if self.adjancy_matrix[row][node.subgraph_index] != None:
+                    self.end_spans.append(self.adjancy_matrix[row][node.subgraph_index])
+        
+
 
 # 子图
 class Subgraph:
@@ -164,7 +264,11 @@ class Subgraph:
         self.adjancy_matrix = []
 
         self.enter_nodes = []
+        self.enter_spans = []
         self.end_nodes = []
+        self.end_spans = []
+
+        self.span_chains = []
 
     def construct_matrix(self, adjancy_matrix):
         nodes_number = len(self.node_list)
@@ -199,7 +303,7 @@ class Subgraph:
     def __eq__(self, subgraph):
         return set(self.node_list) == set(subgraph.node_list)
 
-    def get_enter_nodes(self):
+    def get_enter_nodes_and_spans(self):
         for col in range(0, len(self.node_list)):
             count = 0
             for row in range(0, len(self.node_list)):
@@ -207,8 +311,12 @@ class Subgraph:
                     count = count + 1
             if count == 0:
                 self.enter_nodes.append(self.node_list[col])
+        for node in self.enter_nodes:
+            for col in range(0, len(self.node_list)):
+                if self.adjancy_matrix[node.subgraph_index][col] != None:
+                    self.enter_spans.append(self.adjancy_matrix[node.subgraph_index][col])
 
-    def get_end_nodes(self):
+    def get_end_nodes_and_spans(self):
         for row in range(0, len(self.node_list)):
             count = 0
             for col in range(0, len(self.node_list)):
@@ -216,26 +324,47 @@ class Subgraph:
                     count = count + 1
             if count == 0:
                 self.end_nodes.append(self.node_list[row])
+        for node in self.end_nodes:
+            for row in range(0, len(self.node_list)):
+                if self.adjancy_matrix[row][node.subgraph_index] != None:
+                    self.end_spans.append(self.adjancy_matrix[row][node.subgraph_index])
 
     def generate_span_chains(self):
-        for end_node in self.end_nodes:
-            flag = True
-            while flag:
-                span_list = []
-                for row in range(0, len(self.node_list)):
-                    if self.adjancy_matrix[row][end_node.subgraph_index] != None:
-                        span_list.append(self.adjancy_matrix[row][end_node.subgraph_index])
-                if len(span_list) == 0:
-                    flag = False
-                    continue
-                elif len(span_list) == 1:
-                    end_node = span_list[0].get_caller()
-                    continue
-                else:
-                    ###### here
-                    pass
-        pass
+        ### here
+        self.get_enter_nodes_and_spans()
+        self.get_end_nodes_and_spans()
+        print('enter span number:',len(self.enter_spans),'end span number', len(self.end_spans))
+        sub_subgraph_spans = []
+        # 在子图中依据调用关系
+        for end_span in self.end_spans:
+            sub_subgraph_spans.append(self.get_upstream_spans(end_span))
+        for one_subsubgraph_spans in sub_subgraph_spans:
+            subsubgraph = SubSubGraph(one_subsubgraph_spans)
+            self.span_chains.extend(subsubgraph.span_chains)
 
+
+    def get_upstream_spans(self, span):
+        span_list = [span]
+        if span in self.enter_spans:
+            return span_list
+
+        col_index = span.get_caller().subgraph_index
+        upstream_span_list = []
+        for row in range(0, len(self.node_list)):
+            if self.adjancy_matrix[row][col_index]!=None:
+                upstream_span_list.append(self.adjancy_matrix[row][col_index])
+        
+        if len(upstream_span_list) > 1:
+            real_upstream_span_list = flex_similarity_pruning(span, upstream_span_list)
+            for real_upstream_span in real_upstream_span_list:
+                span_list.extend(self.get_upstream_spans(real_upstream_span))
+        elif len(upstream_span_list) == 1:
+            span_list.append(self.get_upstream_spans(upstream_span_list[0]))
+        
+        else:
+            print('relation error')
+
+        return span_list
 
 # call graph
 class Callgraph:
@@ -344,6 +473,7 @@ class Callgraph:
     def generate_all_span_chains(self):
         for subgraph in self.subgraphs:
             subgraph.generate_span_chains()
+            print()
 
 def split_data(data):
     time_list = [np.nan]*1440
@@ -354,21 +484,25 @@ def split_data(data):
 
     return time_list
 
+# 遇到分支需要流量相似度分辨调用关系
 def flex_similarity_pruning(downstream_span, upstream_spans):
-    callgraph_adjancy_matrix = callgraph.adjancy_matrix
-    upstream_span_number = len(upstream_spans)
-
     choose_list = []
     for span in upstream_spans:
         choose_list.append((span,))
     if len(upstream_spans)>1:
         for i in range(2, len(upstream_spans)+1):
-            choose_list.extend(it.combinations(upstream_spans, i))
-    
+            
+            choose_list.extend(list(it.combinations(upstream_spans, i)))
+
+    pruning_list = []
     for spans in choose_list:
-        ### here
-        pass
-    pass
+        pruning = Pearsonr_Pruning(downstream_span, list(spans))
+        pruning_list.append(pruning)
+
+    pruning_list = sorted(pruning_list, key = lambda x:x.similarity)
+    return pruning_list[-1].compare_span_list 
+    
+
 
 def merge_dict(dic1, dic2):
     for key, value in dic2.items():
@@ -430,7 +564,7 @@ def read_files(path):
     return (temp_caller_data, temp_callee_data, temp_caller_callee)
 
 
-def get_uplink_spans(span, entry_span):
+def get_uplink_spans(span):
     temp_spans = []
     if callee_data.get(span.get_caller()) != None:
         for caller_callee_turple in callee_data[span.get_caller()]:
@@ -439,13 +573,13 @@ def get_uplink_spans(span, entry_span):
             callee = (caller_callee_turple[4], caller_callee_turple[5],
                       caller_callee_turple[6], caller_callee_turple[7])
             metric = caller_callee[caller_callee_turple]
-            new_span = Span(caller, callee, metric, entry_span)
+            new_span = Span(caller, callee, metric)
             # if (new_span not in temp_spans) and (new_span not in uplink_cache_spans):
             temp_spans.append(new_span)
     return temp_spans
 
 
-def get_downlink_spans(span, entry_span):
+def get_downlink_spans(span):
     temp_spans = []
     if caller_data.get(span.get_callee()) != None:
         for caller_callee_turple in caller_data[span.get_callee()]:
@@ -455,7 +589,7 @@ def get_downlink_spans(span, entry_span):
                       caller_callee_turple[6], caller_callee_turple[7])
             metric = caller_callee[caller_callee_turple]
 
-            new_span = Span(caller, callee, metric, entry_span)
+            new_span = Span(caller, callee, metric)
             # if (new_span not in temp_spans) and (new_span not in downlink_cache_spans):
             temp_spans.append(new_span)
     return temp_spans
@@ -521,7 +655,7 @@ if __name__ == '__main__':
 
     entry_rt_anomaly_span_as_caller = []
     entry_rt_anomaly_span_as_callee = []
-    
+
     for key, caller_callee_turples in caller_data.items():
         if key[0] == item_server:
             for caller_callee_turple in caller_callee_turples:
@@ -568,8 +702,16 @@ if __name__ == '__main__':
     #         metric = caller_callee[caller_callee_turple]
     #         span = Span(caller, callee, metric)
     #         entry_spans_as_callee.append(span)
-    print('direct spans finished', len(
-        entry_spans_as_caller), len(entry_spans_as_callee))
+
+    print('direct spans finished', len(entry_spans_as_caller), len(entry_spans_as_callee))
+
+    # 对入口的span进行异常检测, 分类别加入相应的列表
+    for span in entry_spans_as_caller:
+        pass
+
+    for span in entry_spans_as_callee:
+        pass
+
     # 根据上面筛选到的入口span, 分别向上游和下游拓展相关span
 
     uplink_cache_spans = []
