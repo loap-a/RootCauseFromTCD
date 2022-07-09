@@ -1,6 +1,7 @@
 # -*- coding: UTF-8 -*-
 from __future__ import print_function
 from ast import Sub
+from posixpath import split
 import numpy as np
 import pandas as pd
 import os
@@ -9,6 +10,8 @@ import time
 import datetime
 import threading
 import multiprocessing as mp
+import itertools as it
+from functools import cmp_to_key
 
 # 完善了多进程+多线程数据加载
 # 保留前一版本的caller, callee, caller_callee以方便查找(反正内存够用)
@@ -18,10 +21,22 @@ import multiprocessing as mp
 
 class Span:
     # caller, callee 类型为Node
-    def __init__(self, caller, callee, metric):
+    def __init__(self, caller, callee, metric, entry_span=None):
         self.caller = caller
         self.callee = callee
         self.metric = metric
+        self.entry_span = entry_span
+
+        self.discovered = False
+        self.anomaly_detected = False
+
+        self.callgraph_index = -1
+
+    def __init__(self, caller, callee, metric, entry_span):
+        self.caller = caller
+        self.callee = callee
+        self.metric = metric
+        self.entry_span = entry_span
 
         self.discovered = False
         self.anomaly_detected = False
@@ -45,9 +60,27 @@ class Span:
     def get_callee(self):
         return self.callee
 
+    def normalize_metric(self):
+        request_list = split_data(self.metric[0])
+        duration_list = split_data(self.metric[1])
+        exception_list = split_data(self.metric[2])
+        timeout_list = split_data(self.metric[3])
+
+        self.qpm = request_list
+        self.ec = [np.nan]*1440
+        self.rt = [np.nan]*1440
+
+        for exception, timeout, index in zip(exception_list, timeout_list, range(0,1440)):
+            if exception != None and timeout != None:
+                self.ec[index] = exception + timeout
+        
+        for duration, request, index in zip(duration_list, request_list, range(0, 1440)):
+            if duration!=np.nan and request!=np.nan:
+                self.rt[index] = duration/request
+
+
+
 # caller or callee
-
-
 class Node:
     # type代表Node的类型, 为表直观, 其值为'caller' or 'callee'
     def __init__(self, server, service, method, set):
@@ -76,6 +109,40 @@ class Node:
 
 # 子图中的一条调用链
 
+class Pearsonr_Pruning:
+
+    def __init__(self, downstream_span, compare_span_list):
+        self.downstream_span = downstream_span
+        self.compare_span_list = compare_span_list
+        self.lack_data=False
+        self.compute_pearsonr()
+
+    def compute_pearsonr(self):
+        self.compare_qpm = [np.nan]*1440
+        for index in range(0, 1440):
+            flag = True
+            for span in self.compare_span_list:
+                if span.qpm[index] == np.nan:
+                    flag = False
+            if flag:
+                for span in self.compare_span_list:
+                    self.compare_qpm[index] = self.compare_qpm[index] + span.qpm[index]
+        data1 = []
+        data2 = []
+        for downstream_qpm_point, compare_qpm_point in zip(self.downstream_span.qpm, self.compare_qpm):
+            if downstream_qpm_point != np.nan and compare_qpm_point != np.nan:
+                data1.append(downstream_qpm_point)
+                data2.append(compare_qpm_point)
+
+        if len(data1)<20:
+            self.similarity = 0
+            self.p = 1
+            self.lack_data = True
+    
+        else:
+            self.similarity, self.p = pearsonr(data1, data2)
+            self.similarity = abs(self.similarity)
+
 
 class Span_Chain:
 
@@ -95,6 +162,9 @@ class Subgraph:
         self.span_list = []
         self.node_list = node_list
         self.adjancy_matrix = []
+
+        self.enter_nodes = []
+        self.end_nodes = []
 
     def construct_matrix(self, adjancy_matrix):
         nodes_number = len(self.node_list)
@@ -129,6 +199,43 @@ class Subgraph:
     def __eq__(self, subgraph):
         return set(self.node_list) == set(subgraph.node_list)
 
+    def get_enter_nodes(self):
+        for col in range(0, len(self.node_list)):
+            count = 0
+            for row in range(0, len(self.node_list)):
+                if self.adjancy_matrix[row][col] != None:
+                    count = count + 1
+            if count == 0:
+                self.enter_nodes.append(self.node_list[col])
+
+    def get_end_nodes(self):
+        for row in range(0, len(self.node_list)):
+            count = 0
+            for col in range(0, len(self.node_list)):
+                if self.adjancy_matrix[row][col] != None:
+                    count = count + 1
+            if count == 0:
+                self.end_nodes.append(self.node_list[row])
+
+    def generate_span_chains(self):
+        for end_node in self.end_nodes:
+            flag = True
+            while flag:
+                span_list = []
+                for row in range(0, len(self.node_list)):
+                    if self.adjancy_matrix[row][end_node.subgraph_index] != None:
+                        span_list.append(self.adjancy_matrix[row][end_node.subgraph_index])
+                if len(span_list) == 0:
+                    flag = False
+                    continue
+                elif len(span_list) == 1:
+                    end_node = span_list[0].get_caller()
+                    continue
+                else:
+                    ###### here
+                    pass
+        pass
+
 
 # call graph
 class Callgraph:
@@ -139,14 +246,16 @@ class Callgraph:
         self.all_nodes = []
         self.adjancy_matrix = []
         self.generate_all_nodes()
+        self.normalize_all_spans()
         self.generate_adjacency_matrix()
         self.generate_all_subgraphs()
-
         for index, subgraph in enumerate(self.subgraphs):
             print('subgraph -',index,': span number', len(subgraph.span_list),'node number', len(subgraph.node_list), 'matrix count', subgraph.count)
+        self.generate_all_span_chains()
 
-        self.generate_span_chains()
-
+    def normalize_all_spans(self):
+        for span in self.all_spans:
+            span.normalize_metric()
 
     def add_sub_graph(self, subgraph):
         self.subgraphs.append(subgraph)
@@ -232,8 +341,34 @@ class Callgraph:
                 temp_subgraph.construct_matrix(self.adjancy_matrix)
                 self.add_sub_graph(temp_subgraph)
 
-    def generate_span_chains(self):
+    def generate_all_span_chains(self):
+        for subgraph in self.subgraphs:
+            subgraph.generate_span_chains()
+
+def split_data(data):
+    time_list = [np.nan]*1440
+    data_points = data.split(',')
+
+    for data_point in data_points:
+        time_list[int(data_point.split(':')[0])] = float(data_point.split(':')[1])
+
+    return time_list
+
+def flex_similarity_pruning(downstream_span, upstream_spans):
+    callgraph_adjancy_matrix = callgraph.adjancy_matrix
+    upstream_span_number = len(upstream_spans)
+
+    choose_list = []
+    for span in upstream_spans:
+        choose_list.append((span,))
+    if len(upstream_spans)>1:
+        for i in range(2, len(upstream_spans)+1):
+            choose_list.extend(it.combinations(upstream_spans, i))
+    
+    for spans in choose_list:
+        ### here
         pass
+    pass
 
 def merge_dict(dic1, dic2):
     for key, value in dic2.items():
@@ -295,7 +430,7 @@ def read_files(path):
     return (temp_caller_data, temp_callee_data, temp_caller_callee)
 
 
-def get_uplink_spans(span):
+def get_uplink_spans(span, entry_span):
     temp_spans = []
     if callee_data.get(span.get_caller()) != None:
         for caller_callee_turple in callee_data[span.get_caller()]:
@@ -304,13 +439,13 @@ def get_uplink_spans(span):
             callee = (caller_callee_turple[4], caller_callee_turple[5],
                       caller_callee_turple[6], caller_callee_turple[7])
             metric = caller_callee[caller_callee_turple]
-            new_span = Span(caller, callee, metric)
+            new_span = Span(caller, callee, metric, entry_span)
             # if (new_span not in temp_spans) and (new_span not in uplink_cache_spans):
             temp_spans.append(new_span)
     return temp_spans
 
 
-def get_downlink_spans(span):
+def get_downlink_spans(span, entry_span):
     temp_spans = []
     if caller_data.get(span.get_callee()) != None:
         for caller_callee_turple in caller_data[span.get_callee()]:
@@ -320,7 +455,7 @@ def get_downlink_spans(span):
                       caller_callee_turple[6], caller_callee_turple[7])
             metric = caller_callee[caller_callee_turple]
 
-            new_span = Span(caller, callee, metric)
+            new_span = Span(caller, callee, metric, entry_span)
             # if (new_span not in temp_spans) and (new_span not in downlink_cache_spans):
             temp_spans.append(new_span)
     return temp_spans
@@ -378,6 +513,15 @@ if __name__ == '__main__':
     entry_spans_as_callee = []
     entry_spans_as_caller = []
 
+    entry_qpm_anomaly_span_as_caller = []
+    entry_qpm_anomaly_span_as_callee = []
+
+    entry_ec_anomaly_span_as_caller = []
+    entry_ec_anomaly_span_as_callee = []
+
+    entry_rt_anomaly_span_as_caller = []
+    entry_rt_anomaly_span_as_callee = []
+    
     for key, caller_callee_turples in caller_data.items():
         if key[0] == item_server:
             for caller_callee_turple in caller_callee_turples:
