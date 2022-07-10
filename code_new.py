@@ -199,7 +199,7 @@ class SubSubGraph:
             for col in range(0, nodes_number):
                 if self.adjancy_matrix[row][col] != None:
                     self.floyd_g[row][col] = 1
-                    self.floyd_g[col][row] = 1
+
         for k in range(0, nodes_number):
             for i in range(0, nodes_number):
                 for j in range(0, nodes_number):
@@ -214,6 +214,11 @@ class SubSubGraph:
                 node_chain = [enter_node]
                 enter_index = enter_node.subsubgraph_index
                 end_index = end_node.subsubgraph_index
+
+                if self.floyd_g[enter_index][end_index] > 2000:
+                    print('not reachable')
+                    continue
+
                 k = self.floyd_d[enter_index][end_index]
                 while k!=end_index:
                     node_chain.append(self.node_list[k])
@@ -225,6 +230,7 @@ class SubSubGraph:
                     if i+1 < len(node_chain):
                         span_chain.append(self.adjancy_matrix[node_chain[i].subsubgraph_index][node_chain[i+1].subsubgraph_index])
                 span_chains.append(span_chain)   
+
         self.span_chains = span_chains
         return span_chains
 
@@ -238,8 +244,8 @@ class SubSubGraph:
                 self.enter_nodes.append(self.node_list[col])
         for node in self.enter_nodes:
             for col in range(0, len(self.node_list)):
-                if self.adjancy_matrix[node.subgraph_index][col] != None:
-                    self.enter_spans.append(self.adjancy_matrix[node.subgraph_index][col])
+                if self.adjancy_matrix[node.subsubgraph_index][col] != None:
+                    self.enter_spans.append(self.adjancy_matrix[node.subsubgraph_index][col])
 
     def get_end_nodes_and_spans(self):
         for row in range(0, len(self.node_list)):
@@ -251,8 +257,8 @@ class SubSubGraph:
                 self.end_nodes.append(self.node_list[row])
         for node in self.end_nodes:
             for row in range(0, len(self.node_list)):
-                if self.adjancy_matrix[row][node.subgraph_index] != None:
-                    self.end_spans.append(self.adjancy_matrix[row][node.subgraph_index])
+                if self.adjancy_matrix[row][node.subsubgraph_index] != None:
+                    self.end_spans.append(self.adjancy_matrix[row][node.subsubgraph_index])
         
 
 
@@ -359,7 +365,7 @@ class Subgraph:
             for real_upstream_span in real_upstream_span_list:
                 span_list.extend(self.get_upstream_spans(real_upstream_span))
         elif len(upstream_span_list) == 1:
-            span_list.append(self.get_upstream_spans(upstream_span_list[0]))
+            span_list.extend(self.get_upstream_spans(upstream_span_list[0]))
         
         else:
             print('relation error')
@@ -471,9 +477,11 @@ class Callgraph:
                 self.add_sub_graph(temp_subgraph)
 
     def generate_all_span_chains(self):
+        self.span_chains = []
         for subgraph in self.subgraphs:
             subgraph.generate_span_chains()
-            print()
+            self.span_chains.extend(subgraph.span_chains)
+            print('span chain length',len(subgraph.span_chains))
 
 def split_data(data):
     time_list = [np.nan]*1440
