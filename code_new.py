@@ -1,6 +1,7 @@
 # -*- coding: UTF-8 -*-
 from __future__ import print_function
 from ast import Sub
+from multiprocessing.spawn import spawn_main
 from posixpath import split
 import numpy as np
 import pandas as pd
@@ -18,10 +19,9 @@ from functools import cmp_to_key
 # 经过反复修改, 将span作为代码中最根本的数据单元
 # call graph 中的边
 
-
 class Span:
     # caller, callee 类型为Node
-    def __init__(self, caller, callee, metric, entry_span=None):
+    def __init__(self, caller, callee, metric, entry_span=None, is_entry=False):
         self.caller = caller
         self.callee = callee
         self.metric = metric
@@ -31,6 +31,16 @@ class Span:
         self.anomaly_detected = False
 
         self.callgraph_index = -1
+
+        self.qpm_anomaly = False
+        self.ec_anomaly = False
+        self.rt_anomaly = False
+
+        self.qpm_beta = 0.0
+        self.ec_beta = 0.0
+        self.rt_beta = 0.0
+
+        self.is_entry = is_entry
 
     def __eq__(self, span):
         if span == None:
@@ -67,6 +77,47 @@ class Span:
             if (not np.isnan(duration)) and (not np.isnan(duration)):
                 self.rt[index] = duration/request
 
+    def compute_pearsonr_to_entry_span(self):
+
+        if self.is_entry == True:
+            self.entry_span = self
+
+        compare_qpm = self.entry_span.qpm
+        compare_ec = self.entry_span.ec
+        compare_rt = self.entry_span.rt
+
+        data1_qpm = []
+        data2_qpm = []
+
+        data1_ec = []
+        data2_ec = []
+
+        data1_rt = []
+        data2_rt = []
+
+        for data_point, compare_point in zip(self.qpm, compare_qpm):
+            if (not np.isnan(data_point)) and (not np.isnan(compare_point)):
+                data1_qpm.append(data_point)
+                data2_qpm.append(compare_point)
+        
+        for data_point, compare_point in zip(self.ec, compare_ec):
+            if (not np.isnan(data_point)) and (not np.isnan(compare_point)):
+                data1_ec.append(data_point)
+                data2_ec.append(compare_point)
+
+        for data_point, compare_point in zip(self.rt, compare_rt):
+            if (not np.isnan(data_point)) and (not np.isnan(compare_point)):
+                data1_rt.append(data_point)
+                data2_rt.append(compare_point)
+
+
+        if len(data1_qpm) > 20:
+            self.qpm_similarity = abs(pearsonr(data1_qpm, data2_qpm)[0])
+        if len(data1_ec) > 20:
+            self.ec_similarity = abs(pearsonr(data1_ec, data2_ec)[0])
+        if len(data1_rt) > 20:
+            self.rt_similarity = abs(pearsonr(data1_rt, data2_rt)[0])
+
 
 
 # caller or callee
@@ -93,10 +144,25 @@ class Node:
     def __str__(self):
         return '('+self.server+','+self.service+','+self.method+','+self.set+')'
 
+    def __add__(self, node):
+        return self.get_turple() + node.get_turple()
+
     def get_turple(self):
         return (self.server, self.service, self.method, self.set)
 
-# 子图中的一条调用链
+class Root_Cause:
+    def __init__(self, turple, root_score):
+        self.turple = turple
+        self.root_score = root_score
+    
+    def __str__(self):
+        return str(self.turple)+', root score: '+str(self.root_score)
+
+    def __eq__(self, root_cause):
+        if root_cause == None:
+            return False
+        else:
+            return self.turple == root_cause.turple
 
 class Pearsonr_Pruning:
 
@@ -336,10 +402,10 @@ class Subgraph:
                     self.end_spans.append(self.adjancy_matrix[row][node.subgraph_index])
 
     def generate_span_chains(self):
-        ### here
         self.get_enter_nodes_and_spans()
         self.get_end_nodes_and_spans()
         print('enter span number:',len(self.enter_spans),'end span number', len(self.end_spans))
+        print('enter node number:',len(self.enter_nodes),'end node number', len(self.end_nodes))
         sub_subgraph_spans = []
         # 在子图中依据调用关系
         for end_span in self.end_spans:
@@ -374,9 +440,10 @@ class Subgraph:
 
 # call graph
 class Callgraph:
-    def __init__(self, all_spans, entry_spans):
+    def __init__(self, all_spans, entry_spans, kind=0):
         self.all_spans = all_spans
         self.entry_spans = entry_spans
+        self.kind = kind
         self.subgraphs = []
         self.all_nodes = []
         self.adjancy_matrix = []
@@ -387,6 +454,7 @@ class Callgraph:
         for index, subgraph in enumerate(self.subgraphs):
             print('subgraph -',index,': span number', len(subgraph.span_list),'node number', len(subgraph.node_list), 'matrix count', subgraph.count)
         self.generate_all_span_chains()
+        self.root_cause_exploration_in_span_chains(self.kind)
 
     def normalize_all_spans(self):
         for span in self.all_spans:
@@ -481,7 +549,241 @@ class Callgraph:
         for subgraph in self.subgraphs:
             subgraph.generate_span_chains()
             self.span_chains.extend(subgraph.span_chains)
-            print('span chain length',len(subgraph.span_chains))
+            print('span chain number',len(subgraph.span_chains))
+
+    def root_cause_exploration_in_span_chains(self, kind):
+        self.root_cause_list = []
+        for span_chain in self.span_chains:
+            for span in span_chain:
+                anomaly_detection_for_one_span(span)
+                span.compute_pearsonr_to_entry_span()
+        
+        if kind == 0:
+            for span_chain in self.span_chains:
+                span_chain = list(reversed(span_chain))
+
+                start_anomaly_span = None
+                start_index = -1
+                for index, span in enumerate(span_chain):
+                    if span.qpm_anomaly:
+                        start_anomaly_span = span
+                        start_index = index
+
+                if start_anomaly_span == None:
+                    continue
+                else:
+                    index = start_index
+                    while index < len(span_chain):
+                        if (index + 1) < len(span_chain) and span_chain[index+1].qpm_anomaly == False:
+                            root_cause = Root_Cause(span_chain[index].get_caller().get_turple(), span_chain[index].qpm_beta * span_chain[index].qpm_similarity)
+                            if root_cause not in self.root_cause_list:
+                                self.root_cause_list.append(root_cause)
+                            index = index + 2
+                        elif (index + 1) < len(span_chain) and span_chain[index+1].qpm_anomaly == True:
+                            index = index + 1
+                            root_cause = Root_Cause(span_chain[index+1].get_caller().get_turple(), span_chain[index+1].qpm_beta * span_chain[index+1].qpm_similarity)
+                            if root_cause not in self.root_cause_list:
+                                self.root_cause_list.append(root_cause)
+                        elif (index + 1) == len(span_chain):
+                            if span_chain[index].qpm_anomaly == True:
+                                root_cause = Root_Cause(span_chain[index].get_caller().get_turple(), span_chain[index].qpm_beta * span_chain[index].qpm_similarity)
+                                index = index + 1
+                                if root_cause not in self.root_cause_list:
+                                    self.root_cause_list.append(root_cause)
+                            else:
+                                index = index + 1
+
+        elif kind ==1:
+            for span_chain in self.span_chains:
+
+                start_anomaly_span = None
+                start_index = -1
+                for index, span in enumerate(span_chain):
+                    if span.ec_anomaly:
+                        start_anomaly_span = span
+                        start_index = index
+
+                if start_anomaly_span == None:
+                    continue
+                else:
+                    index = start_index
+                    while index < len(span_chain):
+                        if (index + 1) < len(span_chain) and span_chain[index+1].ec_anomaly == False:
+                            root_cause = Root_Cause(span_chain[index].get_callee().get_turple(), span_chain[index].ec_beta * span_chain[index].ec_similarity)
+                            if root_cause not in self.root_cause_list:
+                                self.root_cause_list.append(root_cause)
+                            index = index + 2
+                        elif (index + 1) < len(span_chain) and span_chain[index+1].ec_anomaly == True:
+                            index = index + 1
+                            root_cause = Root_Cause(span_chain[index+1].get_callee().get_turple(), span_chain[index+1].ec_beta * span_chain[index+1].ec_similarity)
+                            if root_cause not in self.root_cause_list:
+                                self.root_cause_list.append(root_cause)
+                        elif (index + 1) == len(span_chain):
+                            if span_chain[index].ec_anomaly == True:
+                                root_cause = Root_Cause(span_chain[index].get_callee().get_turple(), span_chain[index].ec_beta * span_chain[index].ec_similarity)
+                                index = index + 1
+                                if root_cause not in self.root_cause_list:
+                                    self.root_cause_list.append(root_cause)
+                            else:
+                                index = index + 1
+        elif kind == 2:
+            for span_chain in self.span_chains:
+    
+                start_anomaly_span = None
+                start_index = -1
+                for index, span in enumerate(span_chain):
+                    if span.rt_anomaly:
+                        start_anomaly_span = span
+                        start_index = index
+
+                if start_anomaly_span == None:
+                    continue
+                else:
+                    index = start_index
+                    while index < len(span_chain):
+                        if (index + 1) < len(span_chain) and span_chain[index+1].rt_anomaly == False:
+                            root_cause = Root_Cause(span_chain[index].get_callee().get_turple(), span_chain[index].rt_beta * span_chain[index].rt_similarity)
+                            if root_cause not in self.root_cause_list:
+                                self.root_cause_list.append(root_cause)
+                            index = index + 2
+                        elif (index + 1) < len(span_chain) and span_chain[index+1].rt_anomaly == True:
+                            index = index + 1
+                            root_cause = Root_Cause(span_chain[index+1].get_callee().get_turple(), span_chain[index+1].rt_beta * span_chain[index+1].rt_similarity)
+                            if root_cause not in self.root_cause_list:
+                                self.root_cause_list.append(root_cause)
+                        elif (index + 1) == len(span_chain):
+                            if span_chain[index].rt_anomaly == True:
+                                root_cause = Root_Cause(span_chain[index].get_callee().get_turple(), span_chain[index].rt_beta * span_chain[index].rt_similarity)
+                                index = index + 1
+                                if root_cause not in self.root_cause_list:
+                                    self.root_cause_list.append(root_cause)
+                            else:
+                                index = index + 1
+        self.root_cause_list = sorted(self.root_cause_list, key=lambda x: x.root_score, reverse=True)
+        for root_cause in self.root_cause_list:
+            print(root_cause)
+
+def anomaly_detection_for_one_span(span):
+    caller_turple = span.get_caller()
+    callee_turple = span.get_callee()
+
+    span_day_before = None
+    span_7days_before = None
+
+    metric1 = None
+    metric7 = None
+
+    caller_callee_turple = caller_turple + callee_turple
+    if caller_callee1.get(caller_callee_turple) != None:
+        metric1 = caller_callee1[caller_callee_turple]
+    if caller_callee7.get(caller_callee_turple) != None:
+        metric7 = caller_callee7[caller_callee_turple]
+
+    span_day_before = Span(caller_turple, callee_turple, metric1)
+    span_7days_before = Span(caller_turple, callee_turple, metric7)
+    span_day_before.normalize_metric()
+    span_7days_before.normalize_metric()
+
+    exceptions_qpm = [-1] * 30 
+    exceptions_ec = [-1] * 30
+    exceptions_rt = [-1] * 30
+
+    current_qpm = None
+    current_ec = None
+    current_rt = None
+    
+    if alarm_time >= 30:
+        current_qpm = span.qpm[alarm_time-30: alarm_time]
+        current_ec = span.ec[alarm_time-30: alarm_time]
+        current_rt = span.rt[alarm_time-30: alarm_time]
+    else:
+        current_qpm = span.qpm[0:alarm_time]
+        current_ec = span.ec[0:alarm_time]
+        current_rt = span.rt[0:alarm_time]
+
+    # TODO 添加条件判断, alarm_time早于 01:00, 取前一天数据补足
+    comparison_qpm_today = span.qpm[alarm_time-60: alarm_time]
+    comparison_qpm_day_before = span_day_before.qpm[alarm_time-60: alarm_time]
+    comparison_qpm_7days_before = span_7days_before.qpm[alarm_time-60: alarm_time]
+
+    comparison_ec_today = span.ec[alarm_time-60: alarm_time]
+    comparison_ec_day_before = span_day_before.ec[alarm_time-60: alarm_time]
+    comparison_ec_7days_before = span_7days_before.ec[alarm_time-60: alarm_time]
+
+    comparison_rt_today = span.rt[alarm_time-60: alarm_time]
+    comparison_rt_day_before = span_day_before.rt[alarm_time-60: alarm_time]
+    comparison_rt_7days_before = span_7days_before.rt[alarm_time-60: alarm_time]
+
+    sigma(exceptions_qpm, comparison_qpm_today, current_qpm, 0)
+    sigma(exceptions_qpm, comparison_qpm_day_before, current_qpm, 0)
+    sigma(exceptions_qpm, comparison_qpm_7days_before, current_qpm, 0)
+
+    sigma(exceptions_ec, comparison_ec_today, current_ec, 1)
+    sigma(exceptions_ec, comparison_ec_day_before, current_ec, 1)
+    sigma(exceptions_ec, comparison_ec_7days_before, current_ec, 1)
+
+    sigma(exceptions_rt, comparison_rt_today, current_rt, 2)
+    sigma(exceptions_rt, comparison_rt_day_before, current_rt, 2)
+    sigma(exceptions_rt, comparison_rt_7days_before, current_rt, 2)
+
+    qpm_valid = 30 - exceptions_qpm.count(-1)
+    ec_valid = 30 - exceptions_ec.count(-1)
+    rt_valid = 30 - exceptions_rt.count(-1)
+
+    if qpm_valid != 0:
+        if 1.0*exceptions_qpm.count(1) / (30-exceptions_qpm.count(-1)) > threshold:
+            span.qpm_anomaly = True
+            span.qpm_beta = 1.0*exceptions_qpm.count(1) / (30-exceptions_qpm.count(-1))
+    
+    if ec_valid != 0:
+        if 1.0*exceptions_ec.count(1) / (30-exceptions_ec.count(-1)) > threshold:
+            span.ec_anomaly = True
+            span.ec_beta = 1.0*exceptions_ec.count(1) / (30-exceptions_ec.count(-1))
+
+    if rt_valid != 0:
+        if 1.0*exceptions_rt.count(1) / (30-exceptions_rt.count(-1)) > threshold:
+            span.rt_anomaly = True
+            span.rt_beta = 1.0*exceptions_rt.count(1) / (30-exceptions_rt.count(-1))
+            
+
+def data_valid(data_list):
+    count = 0
+    for point in data_list:
+        if not np.isnan(point):
+            count = count + 1
+    return count > 5
+
+def sigma(exceptions, comparison, current, kind):
+    if (not data_valid(comparison)) or (not data_valid(current)):
+        # print('not enough data')
+        return
+    mean, std, count = calculate(comparison)
+    min = mean - 3*std
+    max = mean + 3*std
+    for index, date_point in enumerate(current):
+         if not np.isnan(current[index]):
+                exceptions[index] = 0
+                if kind == 0:
+                    if current[index]< min or current[index] > max:
+                        exceptions[index] = 1
+                else:
+                    if current[index] > max:
+                        exceptions[index] = 1
+
+def calculate(cal_data):
+    count=0
+    sum=0.0
+    std=0.0
+    for i in cal_data:
+        if not np.isnan(i):
+            count+=1
+            sum+=i
+    mean=1.0*sum/count
+    for i in cal_data:
+        if not  np.isnan(i):
+            std+=(i-mean)**2
+    std=(std/count)**0.5
+    return mean,std,count
 
 def split_data(data):
     time_list = [np.nan]*1440
@@ -572,7 +874,7 @@ def read_files(path):
     return (temp_caller_data, temp_callee_data, temp_caller_callee)
 
 
-def get_uplink_spans(span):
+def get_uplink_spans(span, entry_span):
     temp_spans = []
     if callee_data.get(span.get_caller()) != None:
         for caller_callee_turple in callee_data[span.get_caller()]:
@@ -581,13 +883,13 @@ def get_uplink_spans(span):
             callee = (caller_callee_turple[4], caller_callee_turple[5],
                       caller_callee_turple[6], caller_callee_turple[7])
             metric = caller_callee[caller_callee_turple]
-            new_span = Span(caller, callee, metric)
+            new_span = Span(caller, callee, metric, entry_span=entry_span)
             # if (new_span not in temp_spans) and (new_span not in uplink_cache_spans):
             temp_spans.append(new_span)
     return temp_spans
 
 
-def get_downlink_spans(span):
+def get_downlink_spans(span, entry_span):
     temp_spans = []
     if caller_data.get(span.get_callee()) != None:
         for caller_callee_turple in caller_data[span.get_callee()]:
@@ -597,10 +899,45 @@ def get_downlink_spans(span):
                       caller_callee_turple[6], caller_callee_turple[7])
             metric = caller_callee[caller_callee_turple]
 
-            new_span = Span(caller, callee, metric)
+            new_span = Span(caller, callee, metric, entry_span=entry_span)
             # if (new_span not in temp_spans) and (new_span not in downlink_cache_spans):
             temp_spans.append(new_span)
     return temp_spans
+
+def extend_anomaly_entry_span(caller_spans, callee_spans):
+    uplink_cache_spans = []
+    downlink_cache_spans = []
+
+    for span in caller_spans:
+        downlink_cache_spans.extend(get_downlink_spans(span, span))
+    for span in callee_spans:
+        uplink_cache_spans.extend(get_uplink_spans(span, span))
+
+    while len(uplink_cache_spans) != 0:
+        top_span = uplink_cache_spans[0]
+        uplink_cache_spans.pop(0)
+        uplink_spans.append(top_span)
+
+        uplink_cache_spans.extend(get_uplink_spans(top_span, top_span.entry_span))
+
+    while len(downlink_cache_spans) != 0:
+        top_span = downlink_cache_spans[0]
+        downlink_cache_spans.pop(0)
+        downlink_spans.append(top_span)
+
+        downlink_cache_spans.extend(get_downlink_spans(top_span, top_span.entry_span))
+
+    all_related_spans = []
+    entry_spans = []
+
+    entry_spans.extend(caller_spans)
+    entry_spans.extend(callee_spans)
+
+    all_related_spans.extend(entry_spans)
+    all_related_spans.extend(uplink_spans)
+    all_related_spans.extend(downlink_spans)
+
+    return (entry_spans, list(set(all_related_spans)))
 
 
 if __name__ == '__main__':
@@ -610,6 +947,8 @@ if __name__ == '__main__':
     alarm_times = '2021/12/18 17:53'.split()[1].split(':')
     alarm_time = int(alarm_times[0]) * 60 + int(alarm_times[1])
     alarm_date = datetime.datetime.strptime('20211218', '%Y%m%d')
+
+    threshold = 0.2
 
     # 多进程并行计算
     process_pool = mp.Pool(processes=3)
@@ -672,7 +1011,7 @@ if __name__ == '__main__':
                 callee = (caller_callee_turple[4], caller_callee_turple[5],
                           caller_callee_turple[6], caller_callee_turple[7])
                 metric = caller_callee[caller_callee_turple]
-                span = Span(caller, callee, metric)
+                span = Span(caller, callee, metric, is_entry=True)
                 entry_spans_as_caller.append(span)
         else:
             continue
@@ -685,7 +1024,7 @@ if __name__ == '__main__':
                 callee = (caller_callee_turple[4], caller_callee_turple[5],
                           caller_callee_turple[6], caller_callee_turple[7])
                 metric = caller_callee[caller_callee_turple]
-                span = Span(caller, callee, metric)
+                span = Span(caller, callee, metric, is_entry=True)
                 entry_spans_as_callee.append(span)
         else:
             continue
@@ -715,47 +1054,81 @@ if __name__ == '__main__':
 
     # 对入口的span进行异常检测, 分类别加入相应的列表
     for span in entry_spans_as_caller:
-        pass
+        span.normalize_metric()
+        anomaly_detection_for_one_span(span)
+        if span.qpm_anomaly:
+            entry_qpm_anomaly_span_as_caller.append(span)
+        if span.ec_anomaly:
+            entry_ec_anomaly_span_as_caller.append(span)
+        if span.rt_anomaly:
+            entry_rt_anomaly_span_as_caller.append(span)
 
     for span in entry_spans_as_callee:
-        pass
+        span.normalize_metric()
+        anomaly_detection_for_one_span(span)
+        if span.qpm_anomaly:
+            entry_qpm_anomaly_span_as_callee.append(span)
+        if span.ec_anomaly:
+            entry_ec_anomaly_span_as_callee.append(span)
+        if span.rt_anomaly:
+            entry_rt_anomaly_span_as_callee.append(span)
+
+    print('qpm anomaly entry number', len(entry_qpm_anomaly_span_as_caller)+len(entry_qpm_anomaly_span_as_callee))
+    print('ec anomaly entry number', len(entry_ec_anomaly_span_as_caller)+len(entry_ec_anomaly_span_as_callee))
+    print('rt anomaly entry number', len(entry_rt_anomaly_span_as_caller)+len(entry_rt_anomaly_span_as_callee))
 
     # 根据上面筛选到的入口span, 分别向上游和下游拓展相关span
 
-    uplink_cache_spans = []
-    downlink_cache_spans = []
+    # uplink_cache_spans = []
+    # downlink_cache_spans = []
 
-    for span in entry_spans_as_caller:
-        downlink_cache_spans.extend(get_downlink_spans(span))
-    for span in entry_spans_as_callee:
-        uplink_cache_spans.extend(get_uplink_spans(span))
+    # for span in entry_spans_as_caller:
+    #     downlink_cache_spans.extend(get_downlink_spans(span))
+    # for span in entry_spans_as_callee:
+    #     uplink_cache_spans.extend(get_uplink_spans(span))
 
-    while len(uplink_cache_spans) != 0:
-        top_span = uplink_cache_spans[0]
-        uplink_cache_spans.pop(0)
-        uplink_spans.append(top_span)
+    # while len(uplink_cache_spans) != 0:
+    #     top_span = uplink_cache_spans[0]
+    #     uplink_cache_spans.pop(0)
+    #     uplink_spans.append(top_span)
 
-        uplink_cache_spans.extend(get_uplink_spans(top_span))
+    #     uplink_cache_spans.extend(get_uplink_spans(top_span))
 
-    while len(downlink_cache_spans) != 0:
-        top_span = downlink_cache_spans[0]
-        downlink_cache_spans.pop(0)
-        downlink_spans.append(top_span)
+    # while len(downlink_cache_spans) != 0:
+    #     top_span = downlink_cache_spans[0]
+    #     downlink_cache_spans.pop(0)
+    #     downlink_spans.append(top_span)
 
-        downlink_cache_spans.extend(get_downlink_spans(top_span))
+    #     downlink_cache_spans.extend(get_downlink_spans(top_span))
 
-    print('spans拓展完毕', len(uplink_spans), len(downlink_spans))
+    # print('spans拓展完毕', len(uplink_spans), len(downlink_spans))
 
-    all_related_spans = []
-    entry_spans = []
+    # all_related_spans = []
+    # entry_spans = []
 
-    entry_spans.extend(entry_spans_as_caller)
-    entry_spans.extend(entry_spans_as_callee)
+    # entry_spans.extend(entry_spans_as_caller)
+    # entry_spans.extend(entry_spans_as_callee)
 
-    all_related_spans.extend(entry_spans)
-    all_related_spans.extend(uplink_spans)
-    all_related_spans.extend(downlink_spans)
+    # all_related_spans.extend(entry_spans)
+    # all_related_spans.extend(uplink_spans)
+    # all_related_spans.extend(downlink_spans)
 
-    print('all related spans:', len(list(set(all_related_spans))))
+    # print('all related spans:', len(list(set(all_related_spans))))
 
-    callgraph = Callgraph(list(set(all_related_spans)), entry_spans)
+    # 将拓展转移到函数中
+    qpm_anomaly_entry_spans, qpm_anomaly_all_spans = extend_anomaly_entry_span(entry_qpm_anomaly_span_as_caller, entry_qpm_anomaly_span_as_callee)
+    ec_anomaly_entry_spans, ec_anomaly_all_spans = extend_anomaly_entry_span(entry_ec_anomaly_span_as_caller, entry_ec_anomaly_span_as_callee)
+    rt_anomaly_entry_spans, rt_anomaly_all_spans = extend_anomaly_entry_span(entry_rt_anomaly_span_as_caller, entry_rt_anomaly_span_as_callee)
+ 
+    if len(qpm_anomaly_all_spans) == 0:
+        print('no qpm anomaly or lack of data')
+    else:
+        qpm_callgraph = Callgraph(qpm_anomaly_all_spans, qpm_anomaly_entry_spans, 0)
+    if len(ec_anomaly_all_spans) == 0:
+        print('no ec anomaly or lack of data')
+    else:
+        ec_callgraph = Callgraph(ec_anomaly_all_spans, ec_anomaly_entry_spans, 1)
+    if len(rt_anomaly_all_spans) == 0:
+        print('no rt anomaly or lack of data')
+    else:
+        rt_callgraph = Callgraph(rt_anomaly_all_spans, rt_anomaly_entry_spans, 2)
